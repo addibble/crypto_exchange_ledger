@@ -1,0 +1,4 @@
+*.swp
+*.pickle
+apikeys.py
+__pycache__
