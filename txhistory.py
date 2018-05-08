@@ -348,82 +348,20 @@ def get_usd_for_pair(a, b, ts):
         return abs(amt2 / amt1), 1
     if sym1 in ["BTC", "LTC", "ETH"]:
         usd_price = Decimal(gdax_price(f"{sym1}-USD", ts))
-        btc_price = abs(amt1 / amt2)
-        return usd_price / btc_price, btc_price
+        sym2_price = usd_price * abs(amt1) / abs(amt2)
+        print(f"{sym1} ${usd_price} {sym2} ${sym2_price} = {usd_price} * {abs(amt1)} / {abs(amt2)}")
+        return usd_price, sym2_price
     if sym2 in ["BTC", "LTC", "ETH"]:
         usd_price = Decimal(gdax_price(f"{sym2}-USD", ts))
-        btc_price = abs(amt2 / amt1)
-        return btc_price, usd_price / btc_price
+        sym1_price = usd_price * abs(amt2) / abs(amt1)
+        print(f"{sym1} ${sym1_price} = {usd_price} * {abs(amt1)} / {abs(amt2)} {sym2} ${usd_price}")
+        return sym1_price, usd_price
     if sym1 in ["KRW"]:
         return Decimal(1.0) / Decimal(1160.0), Decimal(1160.0) / Decimal(1.0)
     if sym2 in ["KRW"]:
         return Decimal(1160.0) / Decimal(1.0), Decimal(1.0) / Decimal(1160.0)
-    print(f"can't get exchange rate for {a} {b} {ts}")
+    raise ValueError(f"can't get exchange rate for {a} {b} {ts}")
 
-
-def get_usd_unit_price(sym, ledger, ts):
-    if os.path.exists('prices.pickle'):
-        with open('prices.pickle', 'rb') as f:
-            prices = pickle.load(f)
-            if (sym, ledger, ts) in prices:
-                return prices[(sym, ledger, ts)]
-    else:
-        prices = {}
-    if sym in ["USD", "USDT"]:
-        print(f"price for 1 {sym} is 1!")
-        price = Decimal(1)
-    elif sym in ["BTC", "ETH", "LTC"]:
-        price = gdax_price(f"{sym}-USD", ts)
-        print(f"price for 1 {sym} at {ts.ctime()} on gdax is {price}!")
-        price = Decimal(price)
-    elif sym in ["KRW"]:
-        price = Decimal(1.0)/Decimal(1165.0)
-    else:
-        bsym = binance_sym(sym)
-        price_in_btc = Decimal(binance_price(f"{bsym}BTC", ts))
-        price = price_in_btc * Decimal(gdax_price("BTC-USD", ts))
-        print(f"price for 1 {sym} at {ts.ctime()} is {price_in_btc:0.6f}BTC -> {price:0.2f}USD!")
-    if price:
-        prices[(sym, ledger, ts)] = price
-        with open('prices.pickle', 'wb') as f:
-            pickle.dump(prices, f)
-    return price
-    
-def show_trades():
-    transactions = get_all_transactions()
-    balance = defaultdict(Decimal)
-    assets = defaultdict(list)
-    tx_by_date={}
-    trades=[]
-    for t in sorted(transactions):
-        date = t[0].replace(second=0, microsecond=0)
-        ledger = t[1]
-        txtype = normalize_txtype(t[2])
-        if txtype != "trade":
-            continue
-        sym = normalize_sym(t[3])
-        amount = t[4]
-        if date in tx_by_date and tx_by_date[date][0] == ledger:
-            trades.append([tx_by_date[date], [ledger, sym, amount]])
-            print(f"matched {tx_by_date[date]} {[ledger, sym, amount]}")
-            del(tx_by_date[date])
-        else:
-            tx_by_date[date] = [ledger, sym, amount]
-    print("left over")
-    pprint(tx_by_date)
-    return False
-
-
-    for t in sorted(trades):
-        if txtype == "transfer":
-            assets[sym].transfer(amount)
-
-        if txtype == "trade":
-            usd_unit_price = get_usd_unit_price(sym, ledger, date)
-            if not usd_unit_price:
-                raise ValueError(f"could not get usd price for {sym} {date}")
-            assets[sym].trade(amount, usd_unit_price)
-    print(assets)
 
 def match_trades():
     transactions = get_all_transactions()
