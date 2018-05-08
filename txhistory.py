@@ -1,4 +1,4 @@
-#!env python
+#!/usr/bin/env python
 
 import apikeys
 import krakenex
@@ -21,8 +21,49 @@ import dateutil.tz
 from decimal import Decimal
 from collections import defaultdict
 import requests
+from copy import deepcopy
 
 e = {}
+
+class AssetLedger(object):
+    def __init__(self, sym):
+        self.sym = sym
+        self.balance = Decimal(0)
+        self.usd_avg_cost_basis = None
+        if sym in ["USD", "USDT"]:
+            self.usd_avg_cost_basis = Decimal(1.0)
+
+    def trade(self, amount, usd_unit_price):
+        if amount > 0:
+            self.buy(amount, usd_unit_price)
+        else:
+            self.sell(amount, usd_unit_price)
+
+    def buy(self, amount, usd_unit_price):
+        """units, usd_price per 1 unit"""
+        self.balance += amount
+        if self.usd_avg_cost_basis:
+            new_usd_price = ((self.usd_avg_cost_basis * self.balance) + (amount * usd_unit_price)) / (self.balance + amount)
+            print(f"{new_usd_price} $/{self.sym} = (${self.usd_avg_cost_basis:0.2f} * {self.balance}{self.sym}) + ({usd_unit_price:0.2f} * {amount}{self.sym}) / ({self.balance} + {amount}) {self.sym}")
+        else:
+            new_usd_price = usd_unit_price
+            print(f"{new_usd_price} $/{self.sym} = {usd_unit_price}")
+        self.usd_avg_cost_basis = new_usd_price
+        print(f"{self.sym} balance: {self.balance:0.2f} new cost basis ${self.usd_avg_cost_basis:0.2f}")
+
+    def sell(self, amount, usd_unit_price):
+        if amount > self.balance:
+            raise ValueError(f"sell amount {amount} exceeds balance {self.balance}")
+        print(f"selling {amount} of {self.sym} for ${usd_unit_price} cost basis ${self.usd_avg_cost_basis}")
+        profitloss = (amount * usd_unit_price) - (amount * self.usd_avg_cost_basis)
+        print(f"p/l {profitloss}")
+        self.balance -= amount
+
+    def transfer(self, amount):
+        self.balance += amount
+
+    def __repr__(self):
+        return f"AssetLedger {self.balance:0.2f}{self.sym} ${self.usd_avg_cost_basis:0.2f}"
 
 def dp(d):
     try:
@@ -39,6 +80,17 @@ def addtz(x):
     if not x.tzinfo:
         return x.replace(tzinfo=dateutil.tz.tz.tzlocal())
     return x
+
+def other_transactions():
+    transactions = []
+    with open("othertx.txt", encoding="utf-8") as f:
+        for line in f:
+            print("othertx",line)
+            date,txtype,exchange,amount,sym = line.rstrip().split(',')
+            ts = dp(date)
+            transactions.append([ts, exchange, txtype, sym, Decimal(amount)])
+    print(transactions)
+    return transactions
 
 def kraken_transactions():
     transactions = []
@@ -59,31 +111,34 @@ def bithumb_transactions():
     with open("bithumb.txt", encoding="utf-8") as f:
         header = f.readline().split('\t')
         for line in f:
-            rec = line.split('\t')
-            ts = bithumb_dp(rec[0].replace("\"", ""))
+            rec = line.replace("\"", "").split('\t')
+            ts = bithumb_dp(rec[0])
             sym = rec[1]
             order = rec[2]
             qty_coin = Decimal("".join([c for c in rec[3] if c.isdigit() or c == "."]))
-            #if krw_price == "-"
-            #    krw_price = Decimal("".join([c for c in rec[4] if c.isdigit() or c == "."]))
-            qty_krw = Decimal("".join([c for c in rec[5] if c.isdigit() or c == "."]))
-            fee = Decimal(0)
-            if rec[6] != "-":
+            settlement = Decimal("".join([c for c in rec[7] if c.isdigit() or c == "."]))
+            if rec[6] == "-":
+                fee = Decimal(0)
+                fee_sym = "KRW"
+            else:
                 fee = Decimal("".join([c for c in rec[6] if c.isdigit() or c == "."]))
+                fee_sym = rec[6][-3:]
+
             # still need to check that all of the transaction directions go the right way
             if 'BUY' in order:
                 transactions.append([ts, 'bithumb', order, sym, qty_coin, rec])
-                transactions.append([ts, 'bithumb', order, "KRW", -qty_krw, rec])
-                transactions.append([ts, 'bithumb', "fee", sym, -fee, rec])
+                transactions.append([ts, 'bithumb', order, "KRW", -settlement, rec])
+                transactions.append([ts, 'bithumb', "fee", fee_sym, -fee, rec])
             elif 'SELL' in order:
-                transactions.append([ts, 'bithumb', order, sym, qty_coin, rec])
-                transactions.append([ts, 'bithumb', order, "KRW", -qty_krw, rec])
-                transactions.append([ts, 'bithumb', "fee", "KRW", -fee, rec])
+                transactions.append([ts, 'bithumb', order, sym, -qty_coin, rec])
+                transactions.append([ts, 'bithumb', order, "KRW", settlement, rec])
+                transactions.append([ts, 'bithumb', "fee", fee_sym, -fee, rec])
             elif 'DEPOSIT' in order:
                 transactions.append([ts, 'bithumb', "deposit", sym, qty_coin, rec])
+                transactions.append([ts, 'bithumb', "fee", fee_sym, -fee, rec])
             elif 'WITHDRAWAL' in order:
                 transactions.append([ts, 'bithumb', "withdrawal", sym, -qty_coin, rec])
-                transactions.append([ts, 'bithumb', "fee", sym, -fee, rec])
+                transactions.append([ts, 'bithumb', "fee", fee_sym, -fee, rec])
             else:
                 print(f"unknown order type {rec}")
     return transactions
@@ -101,14 +156,14 @@ def bittrex_transactions():
             limit = Decimal(rec[4])
             commission = Decimal(rec[5])
             price = Decimal(rec[6])
-            ts = dp(rec[7])
+            ts = dp(rec[8])
             if 'BUY' in order:
                 transactions.append([ts, 'bittrex', order, base, -price, rec])
-                transactions.append([ts, 'bittrex', order, base, -commission, rec])
+                transactions.append([ts, 'bittrex', "fee", base, -commission, rec])
                 transactions.append([ts, 'bittrex', order, quote, qty, rec])
             elif 'SELL' in order:
                 transactions.append([ts, 'bittrex', order, base, price, rec])
-                transactions.append([ts, 'bittrex', order, base, -commission, rec])
+                transactions.append([ts, 'bittrex', "fee", base, -commission, rec])
                 transactions.append([ts, 'bittrex', order, quote, -qty, rec])
             else:
                 print(f"unknown order type {rec}")
@@ -184,11 +239,26 @@ def coinbase_transactions():
     for a in c.get_accounts()['data']:
         for tx in c.get_transactions(a['id'])['data']:
             created = dp(tx['created_at'])
-            transactions.append([created, 'coinbase', tx['type'], tx['amount']['currency'], Decimal(tx['amount']['amount']), tx])
-            if tx['type'] == "buy" and "Bank of" in tx['details']['payment_method_name']:
-                transactions.append([created, 'bofa', tx['type'], tx['native_amount']['currency'], -Decimal(tx['native_amount']['amount']), tx])
             if tx['type'] in ['fiat_deposit', 'fiat_withdrawal']:
-                transactions.append([created, 'bofa', tx['type'], tx['native_amount']['currency'], -Decimal(tx['native_amount']['amount']), tx])
+                transactions.append([created, 'coinbase', tx['type'],
+                    tx['native_amount']['currency'], Decimal(tx['native_amount']['amount']), tx])
+                transactions.append([created, 'bofa', tx['type'],
+                    tx['native_amount']['currency'], -Decimal(tx['native_amount']['amount']), tx])
+            elif tx['type'] == "buy" and "Bank of" in tx['details']['payment_method_name']:
+                # for a credit card payment, create 2 ledger entries transferring usd from the bank
+                transactions.append([created, 'bofa', "fiat_deposit",
+                    tx['native_amount']['currency'], -Decimal(tx['native_amount']['amount']), tx])
+                transactions.append([created, 'coinbase', "fiat_deposit",
+                    tx['native_amount']['currency'], Decimal(tx['native_amount']['amount']), tx])
+                # now debit the USD from the coinbase account as a buy
+                transactions.append([created, 'coinbase', tx['type'],
+                    tx['native_amount']['currency'], -Decimal(tx['native_amount']['amount']), tx])
+                # and credit the cryptocurrency bought as a buy
+                transactions.append([created, 'coinbase', tx['type'],
+                    tx['amount']['currency'], Decimal(tx['amount']['amount']), tx])
+            else:
+                transactions.append([created, 'coinbase', tx['type'],
+                    tx['amount']['currency'], Decimal(tx['amount']['amount']), tx])
 
     return transactions
 
@@ -205,10 +275,19 @@ def get_transactions(exchange):
         return bittrex_transactions()
     elif exchange == 'bithumb':
         return bithumb_transactions()
+    elif exchange == 'other':
+        return other_transactions()
+
+def binance_sym(sym):
+    syms = {'BCH': 'BCC'}
+    if sym in syms.keys():
+        return syms[sym]
+    else:
+        return sym
 
 def normalize_sym(sym):
     syms = {'XETH': 'ETH', 'XXBT': 'BTC', 'BCC': 'BCH'}
-    if sym in syms:
+    if sym in syms.keys():
         return syms[sym]
     else:
         return sym
@@ -218,14 +297,16 @@ def normalize_txtype(txtype):
         return "trade"
     elif txtype in ['deposit', 'transfer', 'send', 'fiat_deposit', 'fiat_withdrawal', 'exchange_deposit', 'withdraw', 'withdrawal', 'exchange_withdrawal']:
         return "transfer"
-    elif txtype in ['fee', 'rebate', 'commission']:
+    elif txtype in ['fee', 'rebate', 'commission', 'stolen']:
         return "fee"
+    elif txtype in ['gift', 'spent']:
+        return "spent"
     else:
         raise ValueError(f"no such txtype {txtype}")
 
 def get_all_transactions():
     transactions = []
-    exchs = ['gdax', 'coinbase', 'binance', 'kraken', 'bittrex', 'bithumb']
+    exchs = ['gdax', 'coinbase', 'binance', 'kraken', 'bittrex', 'bithumb', 'other']
     for ex in exchs:
         if os.path.exists(f'{ex}.pickle'):
             print(f'unpickling {ex}')
@@ -239,60 +320,304 @@ def get_all_transactions():
         transactions += t
     return transactions
 
-def transaction_trial_balance():
+def gdax_price(market, ts):
+    c = gdax.AuthenticatedClient(apikeys.gdax['apiKey'], apikeys.gdax['secret'], apikeys.gdax['password'])
+    data = c.get_product_historic_rates(market, start=ts.isoformat(), end=(ts+timedelta(minutes=1)).isoformat())
+    sleep(0.5)
+    print(f"gdax price {market} {data[0][1]}")
+    return data[0][1]
+
+def binance_price(market, ts):
+    c = binance.client.Client(apikeys.binance['apiKey'], apikeys.binance['secret'])
+    st=ts.replace(second=0, microsecond=0)
+    et=st + timedelta(minutes=1)
+    sleep(0.5)
+    data = c.get_klines(symbol=market, interval='1m', startTime=int(st.timestamp())*1000, endTime=int(et.timestamp())*1000)
+    print(f"binance price {market} {data[0][3]}")
+    return data[0][3]
+
+def get_usd_for_pair(a, b, ts):
+    """this needs to return 2 values
+    the value of 1 sym1 in USD, and the value of 1 sym2 in USD
+    """
+    sym1, amt1 = a
+    sym2, amt2 = b
+    if sym1 in ["USD", "USDT"]:
+        return 1, abs(amt1 / amt2)
+    elif sym2 in ["USD", "USDT"]:
+        return abs(amt2 / amt1), 1
+    if sym1 in ["BTC", "LTC", "ETH"]:
+        usd_price = Decimal(gdax_price(f"{sym1}-USD", ts))
+        btc_price = abs(amt1 / amt2)
+        return usd_price / btc_price, btc_price
+    if sym2 in ["BTC", "LTC", "ETH"]:
+        usd_price = Decimal(gdax_price(f"{sym2}-USD", ts))
+        btc_price = abs(amt2 / amt1)
+        return btc_price, usd_price / btc_price
+    if sym1 in ["KRW"]:
+        return Decimal(1.0) / Decimal(1160.0), Decimal(1160.0) / Decimal(1.0)
+    if sym2 in ["KRW"]:
+        return Decimal(1160.0) / Decimal(1.0), Decimal(1.0) / Decimal(1160.0)
+    print(f"can't get exchange rate for {a} {b} {ts}")
+
+
+def get_usd_unit_price(sym, ledger, ts):
+    if os.path.exists('prices.pickle'):
+        with open('prices.pickle', 'rb') as f:
+            prices = pickle.load(f)
+            if (sym, ledger, ts) in prices:
+                return prices[(sym, ledger, ts)]
+    else:
+        prices = {}
+    if sym in ["USD", "USDT"]:
+        print(f"price for 1 {sym} is 1!")
+        price = Decimal(1)
+    elif sym in ["BTC", "ETH", "LTC"]:
+        price = gdax_price(f"{sym}-USD", ts)
+        print(f"price for 1 {sym} at {ts.ctime()} on gdax is {price}!")
+        price = Decimal(price)
+    elif sym in ["KRW"]:
+        price = Decimal(1.0)/Decimal(1165.0)
+    else:
+        bsym = binance_sym(sym)
+        price_in_btc = Decimal(binance_price(f"{bsym}BTC", ts))
+        price = price_in_btc * Decimal(gdax_price("BTC-USD", ts))
+        print(f"price for 1 {sym} at {ts.ctime()} is {price_in_btc:0.6f}BTC -> {price:0.2f}USD!")
+    if price:
+        prices[(sym, ledger, ts)] = price
+        with open('prices.pickle', 'wb') as f:
+            pickle.dump(prices, f)
+    return price
+    
+def show_trades():
     transactions = get_all_transactions()
-    totals = defaultdict(Decimal)
-    accounts = defaultdict(lambda: defaultdict(Decimal))
-    taccounts = defaultdict(lambda: defaultdict(Decimal))
-    credits = defaultdict(Decimal)
-    debits = defaultdict(Decimal)
     balance = defaultdict(Decimal)
-    tbalance = defaultdict(Decimal)
-    txns = defaultdict(lambda: defaultdict(Decimal))
-    credit_ctr = Counter()
-    debit_ctr = Counter()
-    last_date = None
+    assets = defaultdict(list)
+    tx_by_date={}
+    trades=[]
+    for t in sorted(transactions):
+        date = t[0].replace(second=0, microsecond=0)
+        ledger = t[1]
+        txtype = normalize_txtype(t[2])
+        if txtype != "trade":
+            continue
+        sym = normalize_sym(t[3])
+        amount = t[4]
+        if date in tx_by_date and tx_by_date[date][0] == ledger:
+            trades.append([tx_by_date[date], [ledger, sym, amount]])
+            print(f"matched {tx_by_date[date]} {[ledger, sym, amount]}")
+            del(tx_by_date[date])
+        else:
+            tx_by_date[date] = [ledger, sym, amount]
+    print("left over")
+    pprint(tx_by_date)
+    return False
+
+
+    for t in sorted(trades):
+        if txtype == "transfer":
+            assets[sym].transfer(amount)
+
+        if txtype == "trade":
+            usd_unit_price = get_usd_unit_price(sym, ledger, date)
+            if not usd_unit_price:
+                raise ValueError(f"could not get usd price for {sym} {date}")
+            assets[sym].trade(amount, usd_unit_price)
+    print(assets)
+
+def match_trades():
+    transactions = get_all_transactions()
+    opentx = defaultdict(list)
+    trades = []
+    assets = {}
+
     for t in sorted(transactions):
         date = t[0]
-        if not last_date:
-            last_date = date
-        if date - timedelta(hours=12) > last_date:
-            pt = prettytable.PrettyTable(['sym']+sorted(taccounts.keys()))
-            bt = prettytable.PrettyTable(["sym","balance"])
-            for sym in sorted(tbalance.keys()):
-                pt.add_row([sym]+[f'{taccounts[exch][sym]:0.2f}' if sym in taccounts[exch] else 'None' for exch in sorted(taccounts.keys())])
-                bt.add_row([sym,f'{tbalance[sym]:0.2f}'])
-            print(pt)
-            print(bt)
-            tbalance = defaultdict(Decimal)
-            taccounts = defaultdict(lambda: defaultdict(Decimal))
-            input("press enter")
-        last_date = date
+        if date.month > 11:
+            break
         ledger = t[1]
         txtype = normalize_txtype(t[2])
         sym = normalize_sym(t[3])
         amount = t[4]
-        balance[sym] += amount
-        accounts[ledger][sym] += amount
-        txns[txtype][sym] += amount
+        if sym not in assets:
+            assets[sym] = AssetLedger(sym)
+        if txtype == "transfer":
+            assets[sym].transfer(amount)
+        if txtype == "trade":
+            print(f"{date.ctime()} looking for {amount:0.2f} {sym} from {ledger} in {opentx[sym]}")
+            newtxlist = []
+            if opentx[ledger]:
+                opentxlist = deepcopy(opentx[ledger])
+                matched = False
+                for p in opentxlist:
+                    o_date, o_sym, o_amount = p
+                    if matched:
+                        newtxlist.append([o_date, o_sym, o_amount])
+                        continue
+                    opposite = False
+                    if (o_amount > 0 and amount < 0) or (o_amount < 0 and amount > 0):
+                        opposite = True
+                    near_date = False
+                    if (max(o_date, date) - min(o_date, date)) < timedelta(seconds=1):
+                        near_date = True
+                    if o_sym != sym and opposite and near_date:
+                        trades.append([o_date, ledger, sym, amount, o_sym, o_amount])
+                        sym_usd, o_sym_usd = get_usd_for_pair((sym, amount), (o_sym, o_amount), o_date)
+                        print(f"matched: {o_date.ctime()} {ledger} {sym} {amount:0.2f} price {sym_usd:0.2f} <-> {o_sym} {o_amount:0.2f} price {o_sym_usd:0.2f}")
+
+                        assets[sym].trade(amount, sym_usd)
+                        assets[o_sym].trade(o_amount, o_sym_usd)
+                        matched = True
+                    else:
+                        newtxlist.append([o_date, o_sym, o_amount])
+                if not matched:
+                    print(f"no match found, adding to open tx list")
+                    newtxlist.append([date, sym, amount])
+            else:
+                print(f"no open tx of {ledger}")
+                newtxlist.append([date, sym, amount])
+            opentx[ledger] = newtxlist
+    print("unclosed tx:")
+    pprint(opentx)
+    print("trades")
+    pprint(trades)
+
+
+def calc_transfer_fees(tolerance=0.01):
+    tolerance = Decimal(tolerance)
+    transactions = get_all_transactions()
+    balance = defaultdict(Decimal)
+    opentx = defaultdict(list)
+
+    for t in sorted(transactions):
+        date = t[0]
+        ledger = t[1]
+        txtype = normalize_txtype(t[2])
+        sym = normalize_sym(t[3])
+        amount = t[4]
+        if txtype == "transfer":
+            print(f"{date.ctime()} looking for {amount:0.2f} {sym} from {ledger} in {opentx[sym]}")
+            newtxlist = []
+            if opentx[sym]:
+                opentxlist = deepcopy(opentx[sym])
+                matched = False
+                for p in opentxlist:
+                    o_date, o_ledger, o_amount = p
+                    if matched:
+                        newtxlist.append([o_date, o_ledger, o_amount])
+                        continue
+                    diff = Decimal(abs(amount + o_amount))
+                    under1 = Decimal(abs(amount)) * tolerance
+                    under2 = Decimal(abs(o_amount)) * tolerance
+                    if o_ledger != ledger and diff < under1 and diff < under2:
+                        network_fee = abs(abs(o_amount) - abs(amount))
+                        print(f"matched: diff {diff:0.4f} {o_date.ctime()} {o_ledger} {o_amount:0.2f} fee {network_fee}")
+                        matched = True
+                    else:
+                        newtxlist.append([o_date, o_ledger, o_amount])
+                if not matched:
+                    print(f"no match found, adding to open tx list")
+                    newtxlist.append([date, ledger, amount])
+            else:
+                print(f"no open tx of {sym}")
+                newtxlist.append([date, ledger, amount])
+            opentx[sym] = newtxlist
+    print("unclosed tx:")
+    pprint(opentx)
+
+
+def transaction_trial_balance(until=None):
+    if not until:
+        until=datetime.now().replace(tzinfo=dateutil.tz.tz.tzlocal())
+    transactions = get_all_transactions()
+    taccounts = defaultdict(lambda: defaultdict(Decimal))
+    tbalance = defaultdict(Decimal)
+    traccounts = defaultdict(lambda: defaultdict(Decimal))
+    trbalance = defaultdict(Decimal)
+    accounts = defaultdict(lambda: defaultdict(Decimal))
+    balance = defaultdict(Decimal)
+    overall_transfer_accounts = defaultdict(lambda: defaultdict(Decimal))
+    overall_transfer_balance = defaultdict(Decimal)
+    last_date = None
+    for t in sorted(transactions):
+        date = t[0]
+        if date > until:
+            break
+        if not last_date:
+            last_date = date
+        ledger = t[1]
+        txtype = normalize_txtype(t[2])
+        sym = normalize_sym(t[3])
+        amount = t[4]
+
+        if date - timedelta(hours=12) > last_date:
+            pt = prettytable.PrettyTable(['sym']+sorted(taccounts.keys()))
+            bt = prettytable.PrettyTable(["sym","balance"])
+            for tsym in sorted(tbalance.keys()):
+                pt.add_row([tsym]+[f'{taccounts[exch][tsym]:0.2f}' if tsym in taccounts[exch] else 'None' for exch in sorted(taccounts.keys())])
+                bt.add_row([tsym,f'{tbalance[tsym]:0.2f}'])
+            print("transfers")
+            print(pt)
+            print(bt)
+            pt = prettytable.PrettyTable(['sym']+sorted(traccounts.keys()))
+            for tsym in sorted(trbalance.keys()):
+                pt.add_row([tsym]+[f'{traccounts[exch][tsym]:0.2f}' if tsym in traccounts[exch] else 'None' for exch in sorted(traccounts.keys())])
+            print("trades")
+            print(pt)
+            tbalance = defaultdict(Decimal)
+            taccounts = defaultdict(lambda: defaultdict(Decimal))
+            trbalance = defaultdict(Decimal)
+            traccounts = defaultdict(lambda: defaultdict(Decimal))
+            pt = prettytable.PrettyTable(['sym']+sorted(accounts.keys()))
+            for tsym in sorted(balance.keys()):
+                pt.add_row([tsym]+[f'{accounts[exch][tsym]:0.2f}' if tsym in accounts[exch] else 'None' for exch in sorted(accounts.keys())])
+            print("balance")
+            print(pt)
+        last_date = date
         if amount > 0:
-            credit_ctr[txtype] += 1
             print(f"{date.ctime()} {amount:0.2f} {sym} -> {ledger} {txtype}")
         else:
-            debit_ctr[txtype] += 1
             print(f"{date.ctime()} {amount:0.2f} {sym} <- {ledger} {txtype}")
         if txtype == "transfer":
             tbalance[sym] += amount
             taccounts[ledger][sym] += amount
-        #print(f'{ledger} {sym} {accounts[ledger][sym]:0.2f}')
-    pt = prettytable.PrettyTable(['sym']+sorted(accounts.keys()))
-    for sym in sorted(balance.keys()):
-        pt.add_row([sym]+[f'{accounts[exch][sym]:0.2f}' if sym in accounts[exch] else 'None' for exch in sorted(accounts.keys())])
+            overall_transfer_accounts[ledger][sym] += amount
+            overall_transfer_balance[sym] += amount
+        else:
+            trbalance[sym] += amount
+            traccounts[ledger][sym] += amount
+        accounts[ledger][sym] += amount
+        balance[sym] += amount
+
+    pt = prettytable.PrettyTable(['sym','amt'])
+    for tsym in sorted(overall_transfer_balance.keys()):
+        pt.add_row([tsym, overall_transfer_balance[tsym]])
+    print("overall transfer balance")
     print(pt)
-    pprint(credit_ctr)
-    pprint(debit_ctr)
-    pprint(txns)
+
+    pt = prettytable.PrettyTable(['sym']+sorted(overall_transfer_accounts.keys()))
+    for tsym in sorted(overall_transfer_balance.keys()):
+        pt.add_row([tsym]+[f'{overall_transfer_accounts[exch][tsym]:0.2f}' if tsym in overall_transfer_accounts[exch] else 'None' for exch in sorted(overall_transfer_accounts.keys())])
+    print("overall transfer balance by account")
+    print(pt)
+
+    pt = prettytable.PrettyTable(['sym']+sorted(accounts.keys()))
+    for tsym in sorted(balance.keys()):
+        pt.add_row([tsym]+[f'{accounts[exch][tsym]:0.2f}' if tsym in accounts[exch] else 'None' for exch in sorted(accounts.keys())])
+    print("final balance")
+    print(pt)
 
 
 if __name__ == '__main__':
-    transaction_trial_balance()
+    if sys.argv[1] == "trades":
+        match_trades()
+    elif sys.argv[1] == "balance":
+        transaction_trial_balance()
+    elif sys.argv[1] == "bittrex":
+        for t in bittrex_transactions():
+            pprint(t)
+            input("press enter")
+    elif sys.argv[1] == "tx":
+        calc_transfer_fees()
+
+
