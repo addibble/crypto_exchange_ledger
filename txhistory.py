@@ -25,45 +25,102 @@ from copy import deepcopy
 
 e = {}
 
-class AssetLedger(object):
-    def __init__(self, sym):
-        self.sym = sym
+class AssetCostBasis(object):
+    def __init__(self):
         self.balance = Decimal(0)
-        self.usd_avg_cost_basis = None
-        if sym in ["USD", "USDT"]:
-            self.usd_avg_cost_basis = Decimal(1.0)
+        self.usd_avg_cost_basis = Decimal(0)
 
-    def trade(self, amount, usd_unit_price):
+    def trade(self, amount, usd_unit_price, sym):
         if amount > 0:
-            self.buy(amount, usd_unit_price)
+            self.buy(amount, usd_unit_price, sym)
         else:
-            self.sell(amount, usd_unit_price)
+            self.sell(amount, usd_unit_price, sym)
 
-    def buy(self, amount, usd_unit_price):
+    def buy(self, amount, usd_unit_price, sym):
         """units, usd_price per 1 unit"""
         self.balance += amount
         if self.usd_avg_cost_basis:
             new_usd_price = ((self.usd_avg_cost_basis * self.balance) + (amount * usd_unit_price)) / (self.balance + amount)
-            print(f"{new_usd_price} $/{self.sym} = (${self.usd_avg_cost_basis:0.2f} * {self.balance}{self.sym}) + ({usd_unit_price:0.2f} * {amount}{self.sym}) / ({self.balance} + {amount}) {self.sym}")
         else:
             new_usd_price = usd_unit_price
-            print(f"{new_usd_price} $/{self.sym} = {usd_unit_price}")
+        print(f'{sym} new cost basis ${new_usd_price:0.2f}')
         self.usd_avg_cost_basis = new_usd_price
-        print(f"{self.sym} balance: {self.balance:0.2f} new cost basis ${self.usd_avg_cost_basis:0.2f}")
 
-    def sell(self, amount, usd_unit_price):
-        if amount > self.balance:
-            raise ValueError(f"sell amount {amount} exceeds balance {self.balance}")
-        print(f"selling {amount} of {self.sym} for ${usd_unit_price} cost basis ${self.usd_avg_cost_basis}")
-        profitloss = (amount * usd_unit_price) - (amount * self.usd_avg_cost_basis)
-        print(f"p/l {profitloss}")
-        self.balance -= amount
-
-    def transfer(self, amount):
+    def sell(self, amount, usd_unit_price, sym):
+        if abs(amount) > self.balance:
+            # raise ValueError(f"sell amount {amount:0.2f} exceeds balance {self.balance:0.2f} of {sym}")
+            print(f"sell amount {amount:0.2f} exceeds balance {self.balance:0.2f} of {sym}")
+        profitloss = (abs(amount) * usd_unit_price) - (abs(amount) * self.usd_avg_cost_basis)
         self.balance += amount
+        print(f"sell {abs(amount):0.2f} {sym} p/l ${profitloss:0.2f} balance {self.balance:0.2f}")
+
+    def transfer(self, amount, sym):
+        self.balance += amount
+        print(f"{sym} += {amount:0.2f} -> {self.balance:0.2f}")
 
     def __repr__(self):
-        return f"AssetLedger {self.balance:0.2f}{self.sym} ${self.usd_avg_cost_basis:0.2f}"
+        return f"AssetCostBasis balance={self.balance:0.2f} ${self.usd_avg_cost_basis:0.2f}"
+
+class AssetTradeMatcher(object):
+    """Attempts to match a list ef trades to what makes the most sense
+    Closest time-wise ordered by ascending value (distance from zero)
+    Raises an error if the lists are different sizes.
+    """
+    def __init__(self):
+        self.tx = []
+
+    def can_resolve(self):
+        syms = set([tx.sym for tx in self.tx])
+        if len(syms) > 2:
+            raise ValueError("can't resolve trades, more than 2 symbols: {self.tx}")
+        if len(syms) == 2 and len(self.tx) % 2 == 0:
+            pos = list(filter(lambda x: x.amount > 0, self.tx))
+            neg = list(filter(lambda x: x.amount < 0, self.tx))
+            if len(pos) == len(neg):
+                return True
+        print(f"tx {self.tx}")
+        return False
+
+    def resolve(self):
+        if not self.can_resolve():
+            return False
+        syms = list(set([tx.sym for tx in self.tx]))
+        sd = {}
+        for sym in syms:
+            sd[sym] = sorted([tx for tx in self.tx if tx.sym == sym], key=lambda x: abs(x.amount))
+
+        for p in zip(sd[syms[0]], sd[syms[1]]):
+            a,b=p
+            near_date = False
+            td = max(a.date, b.date) - min(a.date, b.date)
+            if td < timedelta(seconds=1):
+                near_date = True
+                a_usd, b_usd = get_usd_for_pair((a.sym, a.amount), (b.sym, b.amount), a.date)
+                print(f"matched: {a.date.ctime()} {td} {a.amount:0.2f} {a.sym} ${a_usd:0.2f} <-> {b.amount:0.2f} {b.sym} ${b_usd:0.2f}")
+
+                costbasis[a.sym].trade(a.amount, a_usd, a.sym)
+                costbasis[b.sym].trade(b.amount, b_usd, b.sym)
+        self.tx = []
+
+    def __repr__(self):
+        return "AssetTradeMatcher("+",".join([str(x) for x in self.tx])+")"
+
+    def __str__(self):
+        return self.__repr__()
+
+class AssetLedger(object):
+    def __init__(self, sym=None, amount=None, date=None):
+        self.sym = sym
+        self.amount = amount
+        self.date = date
+
+    def __repr__(self):
+        return f"{self.sym} {self.amount:0.2f} {self.date.ctime()}"
+    def __str__(self):
+        return self.__repr__()
+
+tradematchers = defaultdict(AssetTradeMatcher)
+costbasis = defaultdict(AssetCostBasis)
 
 def dp(d):
     try:
@@ -321,20 +378,45 @@ def get_all_transactions():
     return transactions
 
 def gdax_price(market, ts):
-    c = gdax.AuthenticatedClient(apikeys.gdax['apiKey'], apikeys.gdax['secret'], apikeys.gdax['password'])
-    data = c.get_product_historic_rates(market, start=ts.isoformat(), end=(ts+timedelta(minutes=1)).isoformat())
-    sleep(0.5)
-    print(f"gdax price {market} {data[0][1]}")
-    return data[0][1]
+    if os.path.exists("gdax_price.pickle"):
+        with open("gdax_price.pickle", "rb") as f:
+            p = pickle.load(f)
+    else:
+        p = {}
+    if (market, ts) in p:
+        amt = p[market,ts]
+    else:
+        c = gdax.AuthenticatedClient(apikeys.gdax['apiKey'], apikeys.gdax['secret'], apikeys.gdax['password'])
+        data = c.get_product_historic_rates(market, start=ts.isoformat(), end=(ts+timedelta(minutes=1)).isoformat())
+        sleep(0.5)
+        amt = Decimal(data[0][1])
+        with open("gdax_price.pickle", "wb") as f:
+            p[market,ts] = amt
+            pickle.dump(p, f)
+    print(f"gdax price {market} {amt:0.2f}")
+    return amt
 
 def binance_price(market, ts):
-    c = binance.client.Client(apikeys.binance['apiKey'], apikeys.binance['secret'])
-    st=ts.replace(second=0, microsecond=0)
-    et=st + timedelta(minutes=1)
-    sleep(0.5)
-    data = c.get_klines(symbol=market, interval='1m', startTime=int(st.timestamp())*1000, endTime=int(et.timestamp())*1000)
-    print(f"binance price {market} {data[0][3]}")
-    return data[0][3]
+    if os.path.exists("binance_price.pickle"):
+        with open("binance_price.pickle", "rb") as f:
+            p = pickle.load(f)
+    else:
+        p = {}
+    if (market, ts) in p:
+        amt = p[market,ts]
+    else:
+        c = binance.client.Client(apikeys.binance['apiKey'], apikeys.binance['secret'])
+        st=ts.replace(second=0, microsecond=0)
+        et=st + timedelta(minutes=1)
+        sleep(0.5)
+        data = c.get_klines(symbol=market, interval='1m', startTime=int(st.timestamp())*1000, endTime=int(et.timestamp())*1000)
+        amt = Decimal(data[0][3])
+        with open("binance_price.pickle", "wb") as f:
+            p[market,ts] = amt
+            pickle.dump(p, f)
+
+    print(f"binance price {market} {amt:0.2f}")
+    return amt
 
 def get_usd_for_pair(a, b, ts):
     """this needs to return 2 values
@@ -347,78 +429,65 @@ def get_usd_for_pair(a, b, ts):
     elif sym2 in ["USD", "USDT"]:
         return abs(amt2 / amt1), 1
     if sym1 in ["BTC", "LTC", "ETH"]:
-        usd_price = Decimal(gdax_price(f"{sym1}-USD", ts))
+        usd_price = gdax_price(f"{sym1}-USD", ts)
         sym2_price = usd_price * abs(amt1) / abs(amt2)
-        print(f"{sym1} ${usd_price} {sym2} ${sym2_price} = {usd_price} * {abs(amt1)} / {abs(amt2)}")
+        print(f"{sym1} ${usd_price:0.2f} {sym2} ${sym2_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f}")
         return usd_price, sym2_price
     if sym2 in ["BTC", "LTC", "ETH"]:
-        usd_price = Decimal(gdax_price(f"{sym2}-USD", ts))
+        usd_price = gdax_price(f"{sym2}-USD", ts)
         sym1_price = usd_price * abs(amt2) / abs(amt1)
-        print(f"{sym1} ${sym1_price} = {usd_price} * {abs(amt1)} / {abs(amt2)} {sym2} ${usd_price}")
+        print(f"{sym1} ${sym1_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f} {sym2} ${usd_price:0.2f}")
         return sym1_price, usd_price
-    if sym1 in ["KRW"]:
-        return Decimal(1.0) / Decimal(1160.0), Decimal(1160.0) / Decimal(1.0)
-    if sym2 in ["KRW"]:
-        return Decimal(1160.0) / Decimal(1.0), Decimal(1.0) / Decimal(1160.0)
+    # exclude symbols we know aren't on binance
+    elif sym1 not in ['KRW', 'XLM']:
+        print(f"getting {sym1}BTC from binance")
+        sym1_btc_price = binance_price(f"{binance_sym(sym1)}BTC", ts)
+        btcusd_price = gdax_price(f"BTC-USD", ts)
+        usd_price = sym1_btc_price * btcusd_price
+        sym2_price = usd_price * abs(amt1) / abs(amt2)
+        print(f"{sym1} ${usd_price:0.2f} {sym2} ${sym2_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f}")
+        return usd_price, sym2_price
+    elif sym2 not in ['KRW', 'XLM']:
+        print(f"getting {sym2}BTC from binance")
+        sym2_btc_price = binance_price(f"{binance_sym(sym2)}BTC", ts)
+        btcusd_price = gdax_price(f"BTC-USD", ts)
+        usd_price = sym2_btc_price * btcusd_price
+        sym1_price = usd_price * abs(amt2) / abs(amt1)
+        print(f"{sym1} ${sym1_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f} {sym2} ${usd_price:0.2f}")
+        return sym1_price, usd_price
+
     raise ValueError(f"can't get exchange rate for {a} {b} {ts}")
 
 
 def match_trades():
     transactions = get_all_transactions()
     opentx = defaultdict(list)
-    trades = []
     assets = {}
+    prev_date = datetime(year=2017, month=1, day=1, tzinfo=dateutil.tz.tz.tzlocal())
 
     for t in sorted(transactions):
         date = t[0]
-        if date.month > 11:
-            break
         ledger = t[1]
         txtype = normalize_txtype(t[2])
         sym = normalize_sym(t[3])
         amount = t[4]
-        if sym not in assets:
-            assets[sym] = AssetLedger(sym)
-        if txtype == "transfer":
-            assets[sym].transfer(amount)
+        if txtype in ["gift", "fee", "transfer"]:
+            costbasis[sym].transfer(amount, sym)
+            balance[ledger].transfer(amount, sym)
         if txtype == "trade":
-            print(f"{date.ctime()} looking for {amount:0.2f} {sym} from {ledger} in {opentx[sym]}")
-            newtxlist = []
-            if opentx[ledger]:
-                opentxlist = deepcopy(opentx[ledger])
-                matched = False
-                for p in opentxlist:
-                    o_date, o_sym, o_amount = p
-                    if matched:
-                        newtxlist.append([o_date, o_sym, o_amount])
-                        continue
-                    opposite = False
-                    if (o_amount > 0 and amount < 0) or (o_amount < 0 and amount > 0):
-                        opposite = True
-                    near_date = False
-                    if (max(o_date, date) - min(o_date, date)) < timedelta(seconds=1):
-                        near_date = True
-                    if o_sym != sym and opposite and near_date:
-                        trades.append([o_date, ledger, sym, amount, o_sym, o_amount])
-                        sym_usd, o_sym_usd = get_usd_for_pair((sym, amount), (o_sym, o_amount), o_date)
-                        print(f"matched: {o_date.ctime()} {ledger} {sym} {amount:0.2f} price {sym_usd:0.2f} <-> {o_sym} {o_amount:0.2f} price {o_sym_usd:0.2f}")
+            print(f"trade {date.ctime()} {amount:0.2f} {sym} {ledger}")
+            tradematchers[ledger].tx.append(AssetLedger(sym=sym, date=date, amount=amount))
 
-                        assets[sym].trade(amount, sym_usd)
-                        assets[o_sym].trade(o_amount, o_sym_usd)
-                        matched = True
-                    else:
-                        newtxlist.append([o_date, o_sym, o_amount])
-                if not matched:
-                    print(f"no match found, adding to open tx list")
-                    newtxlist.append([date, sym, amount])
-            else:
-                print(f"no open tx of {ledger}")
-                newtxlist.append([date, sym, amount])
-            opentx[ledger] = newtxlist
-    print("unclosed tx:")
-    pprint(opentx)
-    print("trades")
-    pprint(trades)
+        if date - prev_date > timedelta(seconds=10):
+            for lgr, tm in tradematchers.items():
+                if tm.can_resolve():
+                    print(f"matching trades on {lgr}")
+                    tm.resolve()
+                else:
+                    print(f"can't resolve trades on {lgr} yet")
+        pprint(tradematchers)
+        pprint(costbasis)
+
 
 
 def calc_transfer_fees(tolerance=0.01):
@@ -463,6 +532,10 @@ def calc_transfer_fees(tolerance=0.01):
     print("unclosed tx:")
     pprint(opentx)
 
+def alltx():
+    transactions = get_all_transactions()
+    for t in sorted(transactions):
+        print(f"{t[0].ctime()} {t[1]} {normalize_txtype(t[2])} {normalize_sym(t[3])} {t[4]:0.2f}")
 
 def transaction_trial_balance(until=None):
     if not until:
@@ -551,11 +624,9 @@ if __name__ == '__main__':
         match_trades()
     elif sys.argv[1] == "balance":
         transaction_trial_balance()
-    elif sys.argv[1] == "bittrex":
-        for t in bittrex_transactions():
-            pprint(t)
-            input("press enter")
-    elif sys.argv[1] == "tx":
+    elif sys.argv[1] == "alltx":
+        alltx()
+    elif sys.argv[1] == "fees":
         calc_transfer_fees()
 
 
