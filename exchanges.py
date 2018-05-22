@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import dateutil.parser
 from datetime import datetime
 from datetime import timedelta
@@ -11,6 +13,7 @@ import bittrex
 import binance.client
 import gdax
 import coinbase.wallet.client as coinbase_client
+from decimal import Decimal
 
 
 def dp(d):
@@ -50,8 +53,10 @@ def normalize_txtype(txtype):
         return "transfer"
     elif txtype in ['fee', 'rebate', 'commission', 'stolen']:
         return "fee"
-    elif txtype in ['gift', 'spent']:
+    elif txtype in ['spent']:
         return "spent"
+    elif txtype in ['gift']:
+        return "gift"
     else:
         raise ValueError(f"no such txtype {txtype}")
 
@@ -156,11 +161,9 @@ def other_transactions():
     transactions = []
     with open("othertx.txt", encoding="utf-8") as f:
         for line in f:
-            print("othertx",line)
             date,txtype,exchange,amount,sym = line.rstrip().split(',')
             ts = dp(date)
             transactions.append([ts, exchange, txtype, sym, Decimal(amount)])
-    print(transactions)
     return transactions
 
 def kraken_transactions():

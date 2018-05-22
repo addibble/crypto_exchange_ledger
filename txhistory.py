@@ -13,39 +13,65 @@ from copy import deepcopy
 from exchanges import get_all_transactions, get_usd_for_pair, normalize_txtype, normalize_sym
 from ledger import AssetTradeMatcher, AssetTransferMatcher, AssetCostBasis, AssetLedgerEntry
 
-tradematchers = defaultdict(AssetTradeMatcher)
-transferledger = AssetTransferMatcher()
-costbasis = defaultdict(AssetCostBasis)
+
+class keydefaultdict(defaultdict):
+    def __missing__(self, key):
+        if self.default_factory is None:
+            raise KeyError(key)
+        else:
+            ret = self[key] = self.default_factory(key)
+        return ret
+
+
+def do_resolve(tradematchers, transfermatchers, costbasis):
+    newtradematchers = defaultdict(AssetTradeMatcher)
+    for exch, tm in tradematchers.items():
+        result = tm.resolve(costbasis)
+        if result > 0:
+            newtradematchers[exch] = tm
+            pprint(newtradematchers[exch])
+        print(f"remaining unresolved trades {exch}: {result}")
+    newtransfermatchers = defaultdict(AssetTransferMatcher)
+    for sym, tm in transfermatchers.items():
+        result = tm.resolve()
+        if result > 0:
+            newtransfermatchers[sym] = tm
+            pprint(newtransfermatchers[sym])
+        print(f"remaining unresolved transfers {sym}: {result}")
+    # input("------press any key-----")
+    return newtradematchers, newtransfermatchers, costbasis
 
 def match_trades():
     transactions = get_all_transactions()
-    prev_date = datetime(year=2017, month=1, day=1, tzinfo=dateutil.tz.tz.tzlocal())
+    prev_date = None
+    tradematchers = defaultdict(AssetTradeMatcher)
+    transfermatchers = defaultdict(AssetTransferMatcher)
+    costbasis = keydefaultdict(AssetCostBasis)
 
     for t in sorted(transactions):
-        date = t[0]
-        ledger = t[1]
-        txtype = normalize_txtype(t[2])
-        sym = normalize_sym(t[3])
-        amount = t[4]
-        if txtype == "gift":
+        entry = AssetLedgerEntry(date=t[0], exchange=t[1], txtype=normalize_txtype(t[2]), sym=normalize_sym(t[3]), amount=t[4])
+        if not prev_date:
+            prev_date = entry.date
+        if entry.txtype == "gift":
+            print(f"{entry.date.ctime()} gift subtracting {entry.amount:0.2f} {entry.sym} from CB ({entry.exchange})")
+            costbasis[entry.sym].transfer(entry.amount, entry.date)
+        elif entry.txtype == "transfer":
+            if entry.exchange != "bofa":
+                costbasis[entry.sym].transfer(entry.amount, entry.date)
+            transfermatchers[entry.sym].tx.append(entry)
+        elif entry.txtype == "fee":
             pass
-        elif txtype == "transfer":
-            costbasis[sym].transfer(amount, sym)
-        elif txtype == "fee":
-            pass
-        elif txtype == "trade":
-            print(f"trade {date.ctime()} {amount:0.2f} {sym} {ledger}")
-            tradematchers[ledger].tx.append(AssetLedgerEntry(sym=sym, date=date, amount=amount))
+        elif entry.txtype == "trade":
+            tradematchers[entry.exchange].tx.append(entry)
+        else:
+            print("unknown txtype {entry.txtype} for {entry}")
 
-        if date - prev_date > timedelta(seconds=10):
-            for lgr, tm in tradematchers.items():
-                if tm.can_resolve():
-                    print(f"matching trades on {lgr}")
-                    tm.resolve(costbasis)
-                else:
-                    print(f"can't resolve trades on {lgr} yet")
-        pprint(tradematchers)
-        pprint(costbasis)
+        if entry.date - prev_date > timedelta(seconds=10):
+            tradematchers, transfermatchers, costbasis = do_resolve(tradematchers, transfermatchers, costbasis)
+    tradematchers, transfermatchers, costbasis = do_resolve(tradematchers, transfermatchers, costbasis)
+    pprint(tradematchers)
+    pprint(transfermatchers)
+    pprint(costbasis)
 
 def calc_transfer_fees(tolerance=0.01):
     tolerance = Decimal(tolerance)
@@ -94,7 +120,6 @@ def alltx():
     for t in sorted(transactions):
         print(f"{t[0].ctime()} {t[1]} {normalize_txtype(t[2])} {normalize_sym(t[3])} {t[4]:0.2f}")
 
-def transaction_trial_balance(until=None):
     if not until:
         until=datetime.now().replace(tzinfo=dateutil.tz.tz.tzlocal())
     transactions = get_all_transactions()
@@ -151,8 +176,6 @@ def transaction_trial_balance(until=None):
             taccounts[ledger][sym] += amount
             overall_transfer_accounts[ledger][sym] += amount
             overall_transfer_balance[sym] += amount
-        else:
-            trbalance[sym] += amount
             traccounts[ledger][sym] += amount
         accounts[ledger][sym] += amount
         balance[sym] += amount
@@ -179,8 +202,6 @@ def transaction_trial_balance(until=None):
 if __name__ == '__main__':
     if sys.argv[1] == "trades":
         match_trades()
-    elif sys.argv[1] == "balance":
-        transaction_trial_balance()
     elif sys.argv[1] == "alltx":
         alltx()
     elif sys.argv[1] == "fees":
