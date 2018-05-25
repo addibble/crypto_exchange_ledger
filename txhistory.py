@@ -10,8 +10,8 @@ import dateutil.tz
 from decimal import Decimal
 from collections import defaultdict
 from copy import deepcopy
-from exchanges import get_all_transactions, get_usd_for_pair, normalize_txtype, normalize_sym
-from ledger import AssetTradeMatcher, AssetTransferMatcher, AssetCostBasis, AssetLedgerEntry
+from exchanges import get_all_transactions, get_usd_for_pair, normalize_txtype, normalize_sym, get_current_usd
+from ledger import AssetTradeMatcher, AssetTransferMatcher, AssetCostBasis, AssetLedgerEntry, AssetBalance
 
 
 class keydefaultdict(defaultdict):
@@ -24,187 +24,94 @@ class keydefaultdict(defaultdict):
 
 
 def do_resolve(tradematchers, transfermatchers, costbasis):
+    profit_loss = Decimal(0)
     newtradematchers = defaultdict(AssetTradeMatcher)
     for exch, tm in tradematchers.items():
-        result = tm.resolve(costbasis)
+        result, pl = tm.resolve(costbasis)
+        profit_loss += pl
         if result > 0:
             newtradematchers[exch] = tm
-            pprint(newtradematchers[exch])
-        print(f"remaining unresolved trades {exch}: {result}")
+            #pprint(newtradematchers[exch])
+        #print(f"remaining unresolved trades {exch}: {result}")
     newtransfermatchers = defaultdict(AssetTransferMatcher)
     for sym, tm in transfermatchers.items():
-        result = tm.resolve()
+        result, pl = tm.resolve()
+        profit_loss += pl
         if result > 0:
             newtransfermatchers[sym] = tm
-            pprint(newtransfermatchers[sym])
-        print(f"remaining unresolved transfers {sym}: {result}")
+            #pprint(newtransfermatchers[sym])
+        #print(f"remaining unresolved transfers {sym}: {result}")
     # input("------press any key-----")
-    return newtradematchers, newtransfermatchers, costbasis
+    return newtradematchers, newtransfermatchers, costbasis, profit_loss
 
-def match_trades():
+def match_trades(cutoff_date):
+    if not cutoff_date:
+        cutoff_date = datetime.now().replace(tzinfo=dateutil.tz.tz.tzlocal)
     transactions = get_all_transactions()
     prev_date = None
     tradematchers = defaultdict(AssetTradeMatcher)
     transfermatchers = defaultdict(AssetTransferMatcher)
     costbasis = keydefaultdict(AssetCostBasis)
+    exch_balance = defaultdict(lambda: keydefaultdict(AssetBalance))
+    deposits = Decimal(0)
+    profit_loss = Decimal(0)
 
     for t in sorted(transactions):
         entry = AssetLedgerEntry(date=t[0], exchange=t[1], txtype=normalize_txtype(t[2]), sym=normalize_sym(t[3]), amount=t[4])
+        if entry.date > cutoff_date:
+            break
         if not prev_date:
             prev_date = entry.date
+
+        exch_balance[entry.exchange][entry.sym].balance += entry.amount
         if entry.txtype == "gift":
-            print(f"{entry.date.ctime()} gift subtracting {entry.amount:0.2f} {entry.sym} from CB ({entry.exchange})")
+            #print(f"{entry.date.ctime()} gift subtracting {entry.amount:0.2f} {entry.sym} from CB ({entry.exchange})")
             costbasis[entry.sym].transfer(entry.amount, entry.date)
+            if entry.exchange == "bofa":
+                deposits += entry.amount
         elif entry.txtype == "transfer":
-            if entry.exchange != "bofa":
+            if entry.exchange == "bofa":
+                deposits += entry.amount
+            else:
                 costbasis[entry.sym].transfer(entry.amount, entry.date)
             transfermatchers[entry.sym].tx.append(entry)
-        elif entry.txtype == "fee":
-            pass
+        elif entry.txtype in ["fee"]:
+            usd_unit_price = Decimal(get_current_usd(entry, ts=entry.date))
+            profit_loss += costbasis[entry.sym].trade(entry.amount, usd_unit_price, entry.date, txtype="exchange_fee")
+        elif entry.txtype in ["stolen"]:
+            usd_price = get_current_usd(entry, ts=entry.date) * entry.amount
+            costbasis[entry.sym].transfer(entry.amount, entry.date)
+            profit_loss += usd
         elif entry.txtype == "trade":
             tradematchers[entry.exchange].tx.append(entry)
         else:
             print("unknown txtype {entry.txtype} for {entry}")
 
         if entry.date - prev_date > timedelta(seconds=10):
-            tradematchers, transfermatchers, costbasis = do_resolve(tradematchers, transfermatchers, costbasis)
-    tradematchers, transfermatchers, costbasis = do_resolve(tradematchers, transfermatchers, costbasis)
-    pprint(tradematchers)
-    pprint(transfermatchers)
-    pprint(costbasis)
-
-def calc_transfer_fees(tolerance=0.01):
-    tolerance = Decimal(tolerance)
-    transactions = get_all_transactions()
-    balance = defaultdict(Decimal)
-    opentx = defaultdict(list)
-
-    for t in sorted(transactions):
-        date = t[0]
-        ledger = t[1]
-        txtype = normalize_txtype(t[2])
-        sym = normalize_sym(t[3])
-        amount = t[4]
-        if txtype == "transfer":
-            print(f"{date.ctime()} looking for {amount:0.2f} {sym} from {ledger} in {opentx[sym]}")
-            newtxlist = []
-            if opentx[sym]:
-                opentxlist = deepcopy(opentx[sym])
-                matched = False
-                for p in opentxlist:
-                    o_date, o_ledger, o_amount = p
-                    if matched:
-                        newtxlist.append([o_date, o_ledger, o_amount])
-                        continue
-                    diff = Decimal(abs(amount + o_amount))
-                    under1 = Decimal(abs(amount)) * tolerance
-                    under2 = Decimal(abs(o_amount)) * tolerance
-                    if o_ledger != ledger and diff < under1 and diff < under2:
-                        network_fee = abs(abs(o_amount) - abs(amount))
-                        print(f"matched: diff {diff:0.4f} {o_date.ctime()} {o_ledger} {o_amount:0.2f} fee {network_fee}")
-                        matched = True
-                    else:
-                        newtxlist.append([o_date, o_ledger, o_amount])
-                if not matched:
-                    print(f"no match found, adding to open tx list")
-                    newtxlist.append([date, ledger, amount])
-            else:
-                print(f"no open tx of {sym}")
-                newtxlist.append([date, ledger, amount])
-            opentx[sym] = newtxlist
-    print("unclosed tx:")
-    pprint(opentx)
-
-def alltx():
-    transactions = get_all_transactions()
-    for t in sorted(transactions):
-        print(f"{t[0].ctime()} {t[1]} {normalize_txtype(t[2])} {normalize_sym(t[3])} {t[4]:0.2f}")
-
-    if not until:
-        until=datetime.now().replace(tzinfo=dateutil.tz.tz.tzlocal())
-    transactions = get_all_transactions()
-    taccounts = defaultdict(lambda: defaultdict(Decimal))
-    tbalance = defaultdict(Decimal)
-    traccounts = defaultdict(lambda: defaultdict(Decimal))
-    trbalance = defaultdict(Decimal)
-    accounts = defaultdict(lambda: defaultdict(Decimal))
-    balance = defaultdict(Decimal)
-    overall_transfer_accounts = defaultdict(lambda: defaultdict(Decimal))
-    overall_transfer_balance = defaultdict(Decimal)
-    last_date = None
-    for t in sorted(transactions):
-        date = t[0]
-        if date > until:
-            break
-        if not last_date:
-            last_date = date
-        ledger = t[1]
-        txtype = normalize_txtype(t[2])
-        sym = normalize_sym(t[3])
-        amount = t[4]
-
-        if date - timedelta(hours=12) > last_date:
-            pt = prettytable.PrettyTable(['sym']+sorted(taccounts.keys()))
-            bt = prettytable.PrettyTable(["sym","balance"])
-            for tsym in sorted(tbalance.keys()):
-                pt.add_row([tsym]+[f'{taccounts[exch][tsym]:0.2f}' if tsym in taccounts[exch] else 'None' for exch in sorted(taccounts.keys())])
-                bt.add_row([tsym,f'{tbalance[tsym]:0.2f}'])
-            print("transfers")
-            print(pt)
-            print(bt)
-            pt = prettytable.PrettyTable(['sym']+sorted(traccounts.keys()))
-            for tsym in sorted(trbalance.keys()):
-                pt.add_row([tsym]+[f'{traccounts[exch][tsym]:0.2f}' if tsym in traccounts[exch] else 'None' for exch in sorted(traccounts.keys())])
-            print("trades")
-            print(pt)
-            tbalance = defaultdict(Decimal)
-            taccounts = defaultdict(lambda: defaultdict(Decimal))
-            trbalance = defaultdict(Decimal)
-            traccounts = defaultdict(lambda: defaultdict(Decimal))
-            pt = prettytable.PrettyTable(['sym']+sorted(accounts.keys()))
-            for tsym in sorted(balance.keys()):
-                pt.add_row([tsym]+[f'{accounts[exch][tsym]:0.2f}' if tsym in accounts[exch] else 'None' for exch in sorted(accounts.keys())])
-            print("balance")
-            print(pt)
-        last_date = date
-        if amount > 0:
-            print(f"{date.ctime()} {amount:0.2f} {sym} -> {ledger} {txtype}")
-        else:
-            print(f"{date.ctime()} {amount:0.2f} {sym} <- {ledger} {txtype}")
-        if txtype == "transfer":
-            tbalance[sym] += amount
-            taccounts[ledger][sym] += amount
-            overall_transfer_accounts[ledger][sym] += amount
-            overall_transfer_balance[sym] += amount
-            traccounts[ledger][sym] += amount
-        accounts[ledger][sym] += amount
-        balance[sym] += amount
-
-    pt = prettytable.PrettyTable(['sym','amt'])
-    for tsym in sorted(overall_transfer_balance.keys()):
-        pt.add_row([tsym, overall_transfer_balance[tsym]])
-    print("overall transfer balance")
-    print(pt)
-
-    pt = prettytable.PrettyTable(['sym']+sorted(overall_transfer_accounts.keys()))
-    for tsym in sorted(overall_transfer_balance.keys()):
-        pt.add_row([tsym]+[f'{overall_transfer_accounts[exch][tsym]:0.2f}' if tsym in overall_transfer_accounts[exch] else 'None' for exch in sorted(overall_transfer_accounts.keys())])
-    print("overall transfer balance by account")
-    print(pt)
-
-    pt = prettytable.PrettyTable(['sym']+sorted(accounts.keys()))
-    for tsym in sorted(balance.keys()):
-        pt.add_row([tsym]+[f'{accounts[exch][tsym]:0.2f}' if tsym in accounts[exch] else 'None' for exch in sorted(accounts.keys())])
-    print("final balance")
-    print(pt)
+            tradematchers, transfermatchers, costbasis, pl = do_resolve(tradematchers, transfermatchers, costbasis)
+            profit_loss += pl
+    tradematchers, transfermatchers, costbasis, pl = do_resolve(tradematchers, transfermatchers, costbasis)
+    profit_loss += pl
+    #pprint(tradematchers)
+    #pprint(transfermatchers)
+    #pprint(exch_balance)
+    return costbasis, deposits, profit_loss
 
 
 if __name__ == '__main__':
+    # TODO add date range args for date range report
     if sys.argv[1] == "trades":
-        match_trades()
-    elif sys.argv[1] == "alltx":
-        alltx()
-    elif sys.argv[1] == "fees":
-        calc_transfer_fees()
-
+        costbasis,deposits,profit_loss=match_trades(datetime(year=2018, month=1, day=1, hour=0, minute=0, second=0, tzinfo=dateutil.tz.tz.tzlocal()))
+        #costbasis,deposits,profit_loss=match_trades(datetime.now().replace(tzinfo=dateutil.tz.tz.tzlocal()))
+        pprint(costbasis)
+        if len(sys.argv) > 2:
+            totalusd=0
+            print(f"total cost basis: {sum(map(lambda x: x.balance, costbasis.values()))}")
+            print(f"total deposits: {deposits}")
+            for sym, cb in costbasis.items():
+                usd = cb.balance * Decimal(get_current_usd(cb))
+                totalusd += usd
+                print(f"{sym} {cb.balance} ${usd:0.2f}")
+            print(f"${totalusd:0.2f} current value")
+            print(f"realized p/l: ${profit_loss:0.2f}")
 

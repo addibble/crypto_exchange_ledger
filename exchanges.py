@@ -11,6 +11,7 @@ import apikeys
 import krakenex
 import bittrex
 import binance.client
+from binance.exceptions import BinanceAPIException
 import gdax
 import coinbase.wallet.client as coinbase_client
 from decimal import Decimal
@@ -65,11 +66,11 @@ def get_all_transactions():
     exchs = ['gdax', 'coinbase', 'binance', 'kraken', 'bittrex', 'bithumb', 'other']
     for ex in exchs:
         if os.path.exists(f'{ex}.pickle'):
-            print(f'unpickling {ex}')
+            #print(f'unpickling {ex}')
             with open(f'{ex}.pickle', 'rb') as f:
                 t = pickle.load(f)
         else:
-            print(f'loading {ex}')
+            #print(f'loading {ex}')
             t = get_transactions(ex)
             with open(f'{ex}.pickle', 'wb') as f:
                 pickle.dump(t, f)
@@ -88,11 +89,15 @@ def gdax_price(market, ts):
         c = gdax.AuthenticatedClient(apikeys.gdax['apiKey'], apikeys.gdax['secret'], apikeys.gdax['password'])
         data = c.get_product_historic_rates(market, start=ts.isoformat(), end=(ts+timedelta(minutes=1)).isoformat())
         sleep(0.5)
-        amt = Decimal(data[0][1])
+        try:
+            amt = Decimal(data[0][1])
+        except IndexError:
+            print(market,ts,data)
+            raise
         with open("gdax_price.pickle", "wb") as f:
             p[market,ts] = amt
             pickle.dump(p, f)
-    print(f"gdax price {market} {amt:0.2f}")
+    #print(f"gdax price {market} {amt:0.2f}")
     return amt
 
 def binance_price(market, ts):
@@ -114,7 +119,7 @@ def binance_price(market, ts):
             p[market,ts] = amt
             pickle.dump(p, f)
 
-    print(f"binance price {market} {amt:0.2f}")
+    #print(f"binance price {market} {amt:3g}")
     return amt
 
 def get_usd_for_pair(a, b, ts):
@@ -130,32 +135,53 @@ def get_usd_for_pair(a, b, ts):
     if sym1 in ["BTC", "LTC", "ETH"]:
         usd_price = gdax_price(f"{sym1}-USD", ts)
         sym2_price = usd_price * abs(amt1) / abs(amt2)
-        print(f"{sym1} ${usd_price:0.2f} {sym2} ${sym2_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f}")
+        #print(f"{sym1} ${usd_price:0.2f} {sym2} ${sym2_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f}")
         return usd_price, sym2_price
     if sym2 in ["BTC", "LTC", "ETH"]:
         usd_price = gdax_price(f"{sym2}-USD", ts)
         sym1_price = usd_price * abs(amt2) / abs(amt1)
-        print(f"{sym1} ${sym1_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f} {sym2} ${usd_price:0.2f}")
+        #print(f"{sym1} ${sym1_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f} {sym2} ${usd_price:0.2f}")
         return sym1_price, usd_price
     # exclude symbols we know aren't on binance
     elif sym1 not in ['KRW', 'XLM']:
-        print(f"getting {sym1}BTC from binance")
+        #print(f"getting {sym1}BTC from binance")
         sym1_btc_price = binance_price(f"{binance_sym(sym1)}BTC", ts)
         btcusd_price = gdax_price(f"BTC-USD", ts)
         usd_price = sym1_btc_price * btcusd_price
         sym2_price = usd_price * abs(amt1) / abs(amt2)
-        print(f"{sym1} ${usd_price:0.2f} {sym2} ${sym2_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f}")
+        #print(f"{sym1} ${usd_price:0.2f} {sym2} ${sym2_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f}")
         return usd_price, sym2_price
     elif sym2 not in ['KRW', 'XLM']:
-        print(f"getting {sym2}BTC from binance")
+        #print(f"getting {sym2}BTC from binance")
         sym2_btc_price = binance_price(f"{binance_sym(sym2)}BTC", ts)
         btcusd_price = gdax_price(f"BTC-USD", ts)
         usd_price = sym2_btc_price * btcusd_price
         sym1_price = usd_price * abs(amt2) / abs(amt1)
-        print(f"{sym1} ${sym1_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f} {sym2} ${usd_price:0.2f}")
+        #print(f"{sym1} ${sym1_price:0.2f} = {usd_price:0.2f} * {abs(amt1):0.2f} / {abs(amt2):0.2f} {sym2} ${usd_price:0.2f}")
         return sym1_price, usd_price
 
     raise ValueError(f"can't get exchange rate for {a} {b} {ts}")
+
+def get_current_usd(a, ts=None):
+    if not ts:
+        ts = datetime.now().replace(minute=0, second=0, microsecond=0, tzinfo=dateutil.tz.tz.tzlocal())
+    if a.sym in ["USD", "USDT"]:
+        return 1
+    if a.sym in ["KRW"]:
+        return 1/1165
+    elif a.sym in ["BTC", "LTC", "ETH"]:
+        return gdax_price(f"{a.sym}-USD", ts)
+    elif a.sym == "BCH" and ts > datetime(year=2018, month=1, day=25, tzinfo=dateutil.tz.tz.tzlocal()):
+        return gdax_price(f"{a.sym}-USD", ts)
+    else:
+        try:
+            btc_price = binance_price(f"{binance_sym(a.sym)}BTC", ts)
+        except (TypeError, BinanceAPIException):
+            print(f"ERROR can't get price for {a.sym}")
+            return 0
+        btcusd_price = gdax_price(f"BTC-USD", ts)
+        usd_price = btc_price * btcusd_price
+        return usd_price
 
 def other_transactions():
     transactions = []
@@ -171,7 +197,7 @@ def kraken_transactions():
     apiclient = krakenex.API(key=apikeys.kraken['apiKey'], secret=apikeys.kraken['secret'])
     ledgers = apiclient.query_private('Ledgers')
     for ledgerid, ledger in ledgers['result']['ledger'].items():
-        print(ledger)
+        #print(ledger)
         ts = addtz(datetime.fromtimestamp(ledger['time']))
         transactions.append([ts, 'kraken', ledger['type'], ledger['asset'], Decimal(ledger['amount'])])
         if Decimal(ledger['fee']) > 0.0:
@@ -287,7 +313,6 @@ def binance_transactions():
                     transactions.append([ts, 'binance', 'sell', p['quoteAsset'], Decimal(tx['qty'])*Decimal(tx['price'])])
                     transactions.append([ts, 'binance', 'sell', p['baseAsset'], -Decimal(tx['qty'])])
                 transactions.append([ts, 'binance', 'commission', tx['commissionAsset'], -Decimal(tx['commission'])])
-                # TODO figure out how to visit and download new_assets
     return transactions
 
 def gdax_transactions():
