@@ -3,3 +3,4 @@
 *.txt
 apikeys.py
 __pycache__
+.cache
