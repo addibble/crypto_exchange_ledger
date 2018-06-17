@@ -280,11 +280,11 @@ def bithumb_transactions():
             if "BUY" in order:
                 transactions.append([ts, "bithumb", order, sym, qty_coin, rec])
                 transactions.append([ts, "bithumb", order, "KRW", -settlement, rec])
-                transactions.append([ts, "bithumb", "fee", fee_sym, -fee, rec])
+                #transactions.append([ts, "bithumb", "fee", fee_sym, -fee, rec])
             elif "SELL" in order:
                 transactions.append([ts, "bithumb", order, sym, -qty_coin, rec])
                 transactions.append([ts, "bithumb", order, "KRW", settlement, rec])
-                transactions.append([ts, "bithumb", "fee", fee_sym, -fee, rec])
+                #transactions.append([ts, "bithumb", "fee", fee_sym, -fee, rec])
             elif "DEPOSIT" in order:
                 transactions.append([ts, "bithumb", "deposit", sym, qty_coin, rec])
                 transactions.append([ts, "bithumb", "fee", fee_sym, -fee, rec])

@@ -5,6 +5,7 @@ from datetime import timedelta
 from exchanges import get_usd_for_pair
 from itertools import permutations
 from exchanges import get_current_usd
+from collections import deque
 
 
 class AssetLedgerEntry(object):
@@ -143,10 +144,10 @@ class AssetTradeMatcher(AssetLedger):
 
 
 class AssetCostBasis(object):
-
     def __init__(self, sym):
         self.balance = Decimal(0)
         self.usd_avg_cost_basis = Decimal(0)
+        self.lots = deque()
         self.sym = sym
         self.profit_loss = Decimal(0)
         if sym == "USD":
@@ -156,27 +157,30 @@ class AssetCostBasis(object):
         if amount > 0:
             if not txtype:
                 txtype = "buy"
-            return self.buy(amount, usd_unit_price, date, txtype=txtype)
+            pl = self.buy(amount, usd_unit_price, date, txtype=txtype)
         else:
             if not txtype:
                 txtype = "sell"
-            return self.sell(amount, usd_unit_price, date, txtype=txtype)
+            pl = self.sell(amount, usd_unit_price, date, txtype=txtype)
+        self.balance += amount
+        if not self.sym == "USD" and self.lots:
+            self.usd_avg_cost_basis = sum([a*u for a,u in self.lots]) / sum([a for a, u in self.lots])
+            print(
+                f"{date.ctime()},{txtype},{self.sym},{amount:0.3f},{(self.usd_avg_cost_basis*amount):0.2f},{self.usd_avg_cost_basis:0.2f},0,{self.balance:0.3f}"
+            )
+        else:
+            self.usd_avg_cost_basis = Decimal(1)
+        return pl
 
     def buy(self, amount, usd_unit_price, date, txtype="buy"):
-        """units, usd_price per 1 unit"""
-        if self.usd_avg_cost_basis:
-            new_cost_basis = (
-                (self.usd_avg_cost_basis * self.balance) + (amount * usd_unit_price)
-            ) / (self.balance + amount)
-        else:
-            new_cost_basis = usd_unit_price
-        self.balance += amount
-        # print(f"{date.ctime()} buy {abs(amount):0.2f} {self.sym} new c/b ${new_cost_basis:0.2f} balance {self.balance:0.2f}")
-        if not self.sym == "USD":
-            print(
-                f"{date.ctime()},{txtype},{self.sym},{amount:0.3f},{(new_cost_basis*amount):0.2f},{new_cost_basis:0.2f},0,{self.balance:0.3f}"
-            )
-        self.usd_avg_cost_basis = new_cost_basis
+        self.lots.append((amount, usd_unit_price))
+        total = sum([a for a,u in self.lots])
+        avg_cost = sum([a*u for a,u in self.lots]) / total
+        self.lots = deque([(total, avg_cost)])
+        return Decimal(0)
+
+    def buy_lot(self, amount, usd_unit_price, date, txtype="buy"):
+        self.lots.append((amount, usd_unit_price))
         return Decimal(0)
 
     def sell(self, amount, usd_unit_price, date, txtype="sell"):
@@ -186,13 +190,30 @@ class AssetCostBasis(object):
             abs(amount) * self.usd_avg_cost_basis
         )
         self.profit_loss += profitloss
-        self.balance += amount
+        total = sum([a for a,u in self.lots])
+        self.lots = deque([(total + amount, self.usd_avg_cost_basis)])
         # print(f"{date.ctime()} sell {abs(amount):0.2f} {self.sym} p/l ${profitloss:0.2f} balance {self.balance:0.2f}")
-        if not self.sym == "USD":
-            print(
-                f"{date.ctime()},{txtype},{self.sym},{amount:0.3f},{(usd_unit_price*amount):0.2f},{self.usd_avg_cost_basis:0.2f},{profitloss:0.2f},{self.balance:0.3f}"
-            )
         return Decimal(profitloss)
+
+    def sell_from_lot(self, amount, usd_unit_price, date, txtype="sell"):
+        # if abs(amount) > self.balance:
+        # print(f"{date.ctime()} WARNING! sell amount {amount:0.2f} exceeds balance {self.balance:0.2f} of {self.sym}")
+        profitloss = Decimal(0)
+        if not self.sym == "USD":
+            sell_remaining = amount
+            while sell_remaining < 0:
+                try:
+                    lot_amount, lot_usd_price = self.get_tx()
+                    sell_amount = min(abs(sell_remaining), lot_amount)
+                    sell_remaining += sell_amount
+                    if sell_amount != lot_amount:
+                        self.insert_tx((lot_amount-sell_amount,lot_usd_price))
+                    profitloss += (sell_amount * usd_unit_price) - (sell_amount * lot_usd_price)
+                except IndexError:
+                    raise
+
+            self.profit_loss += profitloss
+        return profitloss
 
     def transfer(self, amount, date):
         # if self.balance > 0 and amount + self.balance < 0:
@@ -207,3 +228,31 @@ class AssetCostBasis(object):
 
     def __repr__(self):
         return self.__str__()
+
+
+class AssetFifoCostBasis(AssetCostBasis):
+    def insert_tx(self, tx):
+        self.lots.appendleft(tx)
+
+    def get_tx(self):
+        return self.lots.popleft()
+
+    def sell(self, amount, usd_unit_price, date, txtype="sell"):
+        return self.sell_from_lot(amount, usd_unit_price, date, txtype=txtype)
+
+    def buy(self, amount, usd_unit_price, date, txtype="buy"):
+        return self.buy_lot(amount, usd_unit_price, date, txtype=txtype)
+    
+
+class AssetLifoCostBasis(AssetCostBasis):
+    def insert_tx(self, tx):
+        self.lots.append(tx)
+
+    def get_tx(self):
+        return self.lots.pop()
+
+    def sell(self, amount, usd_unit_price, date, txtype="sell"):
+        return self.sell_from_lot(amount, usd_unit_price, date, txtype=txtype)
+
+    def buy(self, amount, usd_unit_price, date, txtype="buy"):
+        return self.buy_lot(amount, usd_unit_price, date, txtype=txtype)

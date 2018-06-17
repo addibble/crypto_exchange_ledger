@@ -1,13 +1,11 @@
 import unittest
 from datetime import datetime
 from decimal import Decimal
+import ledger
 
 
 class TestAssetCostBasis(unittest.TestCase):
-
     def test_tx(self):
-        import ledger
-
         cb = ledger.AssetCostBasis("BTC")
         cb.trade(Decimal(1.5), Decimal(10000), datetime.now())
         assert cb.balance == Decimal(1.5)
@@ -20,8 +18,6 @@ class TestAssetCostBasis(unittest.TestCase):
         assert cb.usd_avg_cost_basis == Decimal(15000)
 
     def test_tx2(self):
-        import ledger
-
         cb = ledger.AssetCostBasis("BTC")
         cb.trade(Decimal(1.5), Decimal(10000), datetime.now())
         assert cb.balance == Decimal(1.5)
