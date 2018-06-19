@@ -76,12 +76,14 @@ def normalize_txtype(txtype):
         "exchange_withdrawal",
     ]:
         return "transfer"
-    elif txtype in ["fee", "rebate", "commission", "stolen"]:
+    elif txtype in ["fee", "rebate", "commission"]:
         return "fee"
     elif txtype in ["spent"]:
         return "spent"
     elif txtype in ["gift"]:
         return "gift"
+    elif txtype in ["loss", "stolen"]:
+        return "loss"
     else:
         raise ValueError(f"no such txtype {txtype}")
 

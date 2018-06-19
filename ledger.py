@@ -72,11 +72,11 @@ class AssetTransferMatcher(AssetLedger):
     Closest time-wise ordered by ascending value.
     """
 
-    def resolve(self):
+    def resolve(self, costbasis):
         network_fee = Decimal(0)
         matched = []
         if len(self.tx) < 2:
-            return len(self.tx), network_fee
+            return len(self.tx)
         for a, b in permutations(sorted(self.tx, key=lambda x: abs(x.amount)), r=2):
             amount_delta = abs(
                 (a.amount + b.amount) / max(abs(a.amount), abs(b.amount))
@@ -95,17 +95,13 @@ class AssetTransferMatcher(AssetLedger):
                     src = a
                     dst = b
 
-                fee = AssetLedgerEntry(
-                    sym=src.sym, amount=(dst.amount + src.amount), date=src.date
-                )
-                network_fee += Decimal(get_current_usd(dst, ts=src.date)) * fee.amount
-                # print(f"matched transfer: {src.date.ctime()} {amount_delta*100:0.2f}% {timediff} {src.amount:0.2f} {src.sym} {src.exchange} -> {dst.amount:0.2f} {dst.sym} {dst.exchange} fee {fee.amount:0.5f}")
+                costbasis[src.sym].fee(dst.amount+src.amount, src.date, txtype="network_fee")
 
                 if len(matched) == len(self.tx):
                     break
         for a, b in matched:
             self.tx = list(filter(lambda x: x not in (a, b), self.tx))
-        return len(self.tx), network_fee
+        return len(self.tx)
 
 
 class AssetTradeMatcher(AssetLedger):
@@ -115,9 +111,8 @@ class AssetTradeMatcher(AssetLedger):
     """
 
     def resolve(self, costbasis):
-        profit_loss = Decimal(0)
         if not self.can_resolve():
-            return len(self.tx), Decimal(0)
+            return len(self.tx)
         syms = list(set([tx.sym for tx in self.tx]))
         sd = {}
         for sym in syms:
@@ -134,13 +129,13 @@ class AssetTradeMatcher(AssetLedger):
                 )
                 # print(f"matched trade: {a.date.ctime()} {time_diff} {a.amount:0.2f} {a.sym} ${a_usd:0.2f} <-> {b.amount:0.2f} {b.sym} ${b_usd:0.2f}")
 
-                profit_loss += costbasis[a.sym].trade(a.amount, a_usd, a.date)
-                profit_loss += costbasis[b.sym].trade(b.amount, b_usd, b.date)
+                costbasis[a.sym].trade(a.amount, a_usd, a.date)
+                costbasis[b.sym].trade(b.amount, b_usd, b.date)
             else:
                 newtx.append(a)
                 newtx.append(b)
         self.tx = newtx
-        return len(self.tx), profit_loss
+        return len(self.tx)
 
 
 class AssetCostBasis(object):
@@ -150,8 +145,41 @@ class AssetCostBasis(object):
         self.lots = deque()
         self.sym = sym
         self.profit_loss = Decimal(0)
+        self.pending_fees = Decimal(0)
         if sym == "USD":
             self.usd_avg_cost_basis = Decimal(1.0)
+
+    def loss(self, amount, date, txtype="loss"):
+        profitloss = Decimal(0)
+        loss_remaining = amount
+        while loss_remaining < 0 and self.lots:
+            try:
+                lot_amount, lot_usd_price = self.get_tx()
+                loss_amount = min(abs(loss_remaining), lot_amount)
+                loss_remaining += loss_amount
+                if loss_amount != lot_amount:
+                    self.insert_tx((lot_amount-loss_amount,lot_usd_price))
+                profitloss -= (loss_amount * lot_usd_price)
+            except IndexError:
+                print(f"IndexError {self} {amount} {date}")
+                raise
+            self.balance += amount
+            self.profit_loss += profitloss
+        if loss_remaining < 0:
+            profitloss += loss_remaining
+            usd_price = get_current_usd(AssetLedgerEntry(sym=self.sym), ts=date)
+            print(f"{date.ctime()},{txtype},{self.sym},{abs(amount):0.3f},{profitloss:0.2f}")
+            self.balance += loss_remaining
+        if self.lots:
+            self.usd_avg_cost_basis = sum([a*u for a,u in self.lots]) / sum([a for a, u in self.lots])
+        elif self.sym != "USD":
+            self.usd_avg_cost_basis = Decimal(0)
+
+        if profitloss:
+            print(f"{date.ctime()},{txtype},{self.sym},{abs(amount):0.3f},{profitloss:0.2f}")
+
+    def fee(self, fee_amount, date, txtype=None):
+        self.loss(fee_amount, date, txtype="fee")
 
     def trade(self, amount, usd_unit_price, date, txtype=None):
         if amount > 0:
@@ -162,12 +190,11 @@ class AssetCostBasis(object):
             if not txtype:
                 txtype = "sell"
             pl = self.sell(amount, usd_unit_price, date, txtype=txtype)
+            if self.sym != "USD":
+                print(f"{date.ctime()},{txtype},{self.sym},{abs(amount):0.3f},{pl:0.2f}")
         self.balance += amount
         if not self.sym == "USD" and self.lots:
             self.usd_avg_cost_basis = sum([a*u for a,u in self.lots]) / sum([a for a, u in self.lots])
-            print(
-                f"{date.ctime()},{txtype},{self.sym},{amount:0.3f},{(self.usd_avg_cost_basis*amount):0.2f},{self.usd_avg_cost_basis:0.2f},0,{self.balance:0.3f}"
-            )
         else:
             self.usd_avg_cost_basis = Decimal(1)
         return pl
@@ -199,31 +226,38 @@ class AssetCostBasis(object):
         # if abs(amount) > self.balance:
         # print(f"{date.ctime()} WARNING! sell amount {amount:0.2f} exceeds balance {self.balance:0.2f} of {self.sym}")
         profitloss = Decimal(0)
-        if not self.sym == "USD":
-            sell_remaining = amount
-            while sell_remaining < 0:
-                try:
-                    lot_amount, lot_usd_price = self.get_tx()
-                    sell_amount = min(abs(sell_remaining), lot_amount)
-                    sell_remaining += sell_amount
-                    if sell_amount != lot_amount:
-                        self.insert_tx((lot_amount-sell_amount,lot_usd_price))
-                    profitloss += (sell_amount * usd_unit_price) - (sell_amount * lot_usd_price)
-                except IndexError:
-                    raise
+        if self.sym == "USD":
+            return profitloss
+        sell_remaining = amount
+        while sell_remaining < 0 and self.lots:
+            try:
+                lot_amount, lot_usd_price = self.get_tx()
+                sell_amount = min(abs(sell_remaining), lot_amount)
+                sell_remaining += sell_amount
+                if sell_amount != lot_amount:
+                    self.insert_tx((lot_amount-sell_amount,lot_usd_price))
+                profitloss += (sell_amount * usd_unit_price) - (sell_amount * lot_usd_price)
+            except IndexError:
+                print(f"IndexError {self} {amount} {date}")
+                raise
 
-            self.profit_loss += profitloss
+        if sell_remaining < 0:
+            usd_price = get_current_usd(AssetLedgerEntry(sym=self.sym), ts=date)
+            print(f"WARNING deducting unmatched sale of {sell_remaining:0.2f} {self.sym} from P/L")
+            profitloss += Decimal(usd_price) * Decimal(sell_remaining)
+            self.balance += sell_remaining
+
+        self.profit_loss += profitloss
         return profitloss
 
     def transfer(self, amount, date):
         # if self.balance > 0 and amount + self.balance < 0:
         # print(f"{date.ctime()} WARNING! transfer amount {amount:0.2f} exceeds balance {self.balance:0.2f} of {self.sym}")
         self.balance += amount
-        # print(f"{date.ctime()} CostBasisTransfer {self.sym} += {amount:0.2f} -> {self.balance:0.2f}")
 
     def __str__(self):
         return (
-            f"{type(self).__name__}(balance={self.balance:0.2f}, ${self.usd_avg_cost_basis:0.2f})"
+            f"{type(self).__name__}(sym={self.sym}, balance={self.balance:0.2f}, CB ${self.usd_avg_cost_basis:0.2f}, profit_loss={self.profit_loss}, lots={self.lots})"
         )
 
     def __repr__(self):
